@@ -74,5 +74,13 @@ Desktop.ini
 # GitHub Actions
 .github/
 
+# Build artifacts
+build/
+dist/
+*.spec
+
+# Batch files (optional - comment out if you want to include them in git)
+# *.bat
+
 # Ignore local files
 local_settings.py
