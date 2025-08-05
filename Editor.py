@@ -202,10 +202,49 @@ class Persona3Save:
         self.Data = {}
         self.Data["money"] = self.LoadByNameN(
             self.js, "UInt32Property", 0, 7257 + self.id_offset)
-        # Get playtime from primary location or try alternative location
-        playtime = self.LoadByNameN(self.js, "UInt32Property", 0, 12833 + self.id_offset)
-        if playtime is None:
-            playtime = self.LoadByName(self.js[1]["value"], "PlayTime", 0, 1)
+        
+        # Improved playtime detection based on save format analysis
+        # Old saves: playtime often at offset location (12837) but not primary (12833)
+        # New saves: playtime at primary location (12833) but not offset (12837)
+        playtime = None
+        playtime_primary_with_offset = self.LoadByNameN(self.js, "UInt32Property", 0, 12833 + self.id_offset)
+        playtime_primary_standard = self.LoadByNameN(self.js, "UInt32Property", 0, 12833)  # Standard location
+        playtime_offset = self.LoadByNameN(self.js, "UInt32Property", 0, 12837)  # Offset location for old saves
+        playtime_header = self.LoadByName(self.js[1]["value"], "PlayTime", 0, 1)
+        
+        # Smart playtime selection based on format and data quality
+        # For new saves with +4 offset, check both standard and offset-adjusted locations
+        if playtime_primary_with_offset is not None and 0 < playtime_primary_with_offset < 3600 * 999:
+            # Primary location with offset has reasonable value
+            playtime = playtime_primary_with_offset
+            self.playtime_source = f"primary location with offset (12833+{self.id_offset})"
+        elif playtime_primary_standard is not None and 0 < playtime_primary_standard < 3600 * 999:
+            # Standard primary location has reasonable value (common for new saves)
+            playtime = playtime_primary_standard
+            self.playtime_source = "standard primary location (12833)"
+        elif playtime_offset is not None and 0 < playtime_offset < 3600 * 999:
+            # Offset location has reasonable value (typical for old saves)
+            playtime = playtime_offset
+            self.playtime_source = "offset location (12837)"
+        elif playtime_header is not None and 0 < playtime_header < 3600 * 999:
+            # Header has reasonable value
+            playtime = playtime_header
+            self.playtime_source = "header location"
+        elif playtime_primary_with_offset is not None:
+            # Use primary with offset even if value seems large
+            playtime = playtime_primary_with_offset
+            self.playtime_source = f"primary location with offset (12833+{self.id_offset}) - unvalidated"
+        elif playtime_primary_standard is not None:
+            # Use standard primary even if value seems large
+            playtime = playtime_primary_standard
+            self.playtime_source = "standard primary location (12833) - unvalidated"
+        elif playtime_offset is not None:
+            # Use offset even if value seems large
+            playtime = playtime_offset
+            self.playtime_source = "offset location (12837) - unvalidated"
+        else:
+            self.playtime_source = "not found"
+            
         self.Data["playtime"] = playtime
         # Apply offset to all character IDs
         self.Data["characters"] = {
@@ -495,38 +534,9 @@ class Persona3Save:
         print(
             f"   Name: {self.SaveHeader['firstname']} {self.SaveHeader['lastname']}")
 
-        # Money and playtime
+        # Money and playtime  
         money = self.LoadByNameN(self.js, "UInt32Property", 0, 7257 + self.id_offset)
-        
-        # Enhanced playtime detection with multiple fallback locations
-        playtime = None
-        playtime_source = None
-        
-        # First try standard location with offset
-        playtime = self.LoadByNameN(self.js, "UInt32Property", 0, 12833 + self.id_offset)
-        if playtime is not None:
-            playtime_source = "primary"
-            
-        # If not found, try alternative standard location (some game versions use this)
-        if playtime is None:
-            playtime = self.LoadByNameN(self.js, "UInt32Property", 0, 12833)  # Try without offset
-            if playtime is not None:
-                playtime_source = "alternate"
-                
-        # If still not found, try the header section
-        if playtime is None:
-            playtime = self.LoadByName(self.js[1]["value"], "PlayTime", 0, 1)
-            if playtime is not None:
-                playtime_source = "header"
-        
-        # Final fallback: Try a different UInt32 property that might contain playtime
-        if playtime is None:
-            for i in range(12830, 12840):  # Try a range of nearby values
-                test_playtime = self.LoadByNameN(self.js, "UInt32Property", 0, i)
-                if test_playtime is not None and 3600 <= test_playtime <= 3600 * 999:  # Reasonable playtime range
-                    playtime = test_playtime
-                    playtime_source = f"discovered at offset {i}"
-                    break
+        playtime = self.Data.get("playtime")
         
         if money is not None:
             print(f"   💰 Money: {money:,} yen")
@@ -537,7 +547,7 @@ class Persona3Save:
             seconds = playtime % 60
             print(f"   ⏱️  Playtime: {hours}h {minutes}m {seconds}s")
             print(f"   📊 Raw Playtime: {playtime} seconds")
-            print(f"   🔍 Playtime source: {playtime_source}")
+            print(f"   🔍 Playtime source: {getattr(self, 'playtime_source', 'detected via LoadData')}")
         else:
             print(f"   ⏱️  Playtime: Not found in save file")
             print(f"   ❌ Could not detect playtime in any known location")
@@ -1831,91 +1841,126 @@ class Persona3Save:
 
     def DetectSaveFormatVersion(self):
         """
-        Enhanced method to detect save format version with multiple check points.
+        Improved method to detect save format version based on analysis of real save files.
         Returns 4 for new format, 0 for old format.
         
-        Detection strategy:
-        - Check multiple important values at both old and new locations
-        - Use a voting system to determine the most likely format
-        - Validate detection with cross-checks
+        Key insights from analysis:
+        - Old saves: data only at original locations (e.g., money at 7257)
+        - New saves: data at BOTH old and new locations, but NEW location has the correct/primary data
+        - Need to check data quality and patterns, not just existence
         
-        This improved method should work reliably across all game versions and updates.
+        Strategy:
+        1. Check if data exists at both old and new locations (indicates new format)
+        2. For cases with conflicting data, use data quality indicators
+        3. Use specific patterns observed in the analysis
         """
-        # Dictionary to track detection results
-        detection_points = {
+        # Collect evidence for format detection
+        evidence = {
             "old_format": 0,
-            "new_format": 0
+            "new_format": 0,
+            "detailed_checks": {}
         }
         
-        # Check 1: Money value
+        # Check 1: Money value pattern analysis
         money_old = self.LoadByNameN(self.js, "UInt32Property", 0, 7257)
         money_new = self.LoadByNameN(self.js, "UInt32Property", 0, 7261)  # 7257+4
         
-        if money_old is not None and money_old > 0:
-            detection_points["old_format"] += 2
-        if money_new is not None and money_new > 0:
-            detection_points["new_format"] += 2
-            
-        # Check 2: Main character level
-        mc_level_old = self.LoadByNameN(self.js, "UInt32Property", 0, 13078)
-        mc_level_new = self.LoadByNameN(self.js, "UInt32Property", 0, 13082)  # 13078+4
+        evidence["detailed_checks"]["money"] = {"old": money_old, "new": money_new}
         
-        if mc_level_old is not None and 1 <= mc_level_old <= 99:
-            detection_points["old_format"] += 3  # Higher weight for level check
-        if mc_level_new is not None and 1 <= mc_level_new <= 99:
-            detection_points["new_format"] += 3  # Higher weight for level check
+        # Pattern from analysis: New saves often have money at BOTH locations
+        if money_old is not None and money_new is not None:
+            # Both exist - this strongly suggests new format
+            evidence["new_format"] += 4
+            evidence["detailed_checks"]["money"]["pattern"] = "both_exist_suggests_new"
+        elif money_old is not None and money_new is None:
+            # Only old exists - suggests old format
+            evidence["old_format"] += 3
+            evidence["detailed_checks"]["money"]["pattern"] = "only_old_suggests_old"
+        elif money_old is None and money_new is not None:
+            # Only new exists - definitely new format
+            evidence["new_format"] += 5
+            evidence["detailed_checks"]["money"]["pattern"] = "only_new_definitely_new"
             
-        # Check 3: Date value (should be within reasonable range)
+        # Check 2: Playtime pattern analysis - key differentiator from analysis
+        playtime_primary = self.LoadByNameN(self.js, "UInt32Property", 0, 12833)
+        playtime_offset = self.LoadByNameN(self.js, "UInt32Property", 0, 12837)  # 12833+4
+        
+        evidence["detailed_checks"]["playtime"] = {"primary": playtime_primary, "offset": playtime_offset}
+        
+        # Pattern from analysis: 
+        # - Old saves have playtime at offset location (12837) but not primary (12833)
+        # - New saves have playtime at primary location (12833) but not offset (12837)
+        if playtime_primary is not None and playtime_offset is None:
+            # Primary exists, offset doesn't - suggests new format
+            evidence["new_format"] += 3
+            evidence["detailed_checks"]["playtime"]["pattern"] = "primary_only_suggests_new"
+        elif playtime_primary is None and playtime_offset is not None:
+            # Offset exists, primary doesn't - suggests old format
+            evidence["old_format"] += 3
+            evidence["detailed_checks"]["playtime"]["pattern"] = "offset_only_suggests_old"
+        elif playtime_primary is not None and playtime_offset is not None:
+            # Both exist - check which has reasonable values
+            if 0 < playtime_primary < 3600 * 999 and playtime_offset > 3600 * 999:
+                # Primary has reasonable value, offset is too large
+                evidence["new_format"] += 2
+                evidence["detailed_checks"]["playtime"]["pattern"] = "primary_reasonable_new"
+            elif 0 < playtime_offset < 3600 * 999 and playtime_primary > 3600 * 999:
+                # Offset has reasonable value, primary is too large  
+                evidence["old_format"] += 2
+                evidence["detailed_checks"]["playtime"]["pattern"] = "offset_reasonable_old"
+                
+        # Check 3: Date value patterns
         date_old = self.LoadByNameN(self.js, "UInt32Property", 0, 1928)
         date_new = self.LoadByNameN(self.js, "UInt32Property", 0, 1932)  # 1928+4
         
-        if date_old is not None and 0 <= date_old <= 365:  # Roughly a year's worth of days
-            detection_points["old_format"] += 1
+        evidence["detailed_checks"]["date"] = {"old": date_old, "new": date_new}
+        
+        # From analysis: old saves have reasonable dates at old location, new saves at new location
+        if date_old is not None and 0 <= date_old <= 365:
+            evidence["old_format"] += 1
         if date_new is not None and 0 <= date_new <= 365:
-            detection_points["new_format"] += 1
+            evidence["new_format"] += 1
             
-        # Check 4: Time value (should be within valid range, typically 257-265)
+        # Strong indicator: if date is None at old location but exists at new, it's new format
+        if date_old is None and date_new is not None:
+            evidence["new_format"] += 2
+            evidence["detailed_checks"]["date"]["pattern"] = "only_new_location"
+            
+        # Check 4: Character level patterns
+        mc_level_old = self.LoadByNameN(self.js, "UInt32Property", 0, 13078)
+        mc_level_new = self.LoadByNameN(self.js, "UInt32Property", 0, 13082)  # 13078+4
+        
+        evidence["detailed_checks"]["level"] = {"old": mc_level_old, "new": mc_level_new}
+        
+        if mc_level_old is not None and 1 <= mc_level_old <= 99:
+            evidence["old_format"] += 2
+        if mc_level_new is not None and 1 <= mc_level_new <= 99:
+            evidence["new_format"] += 2
+            
+        # Check 5: Time value validation  
         time_old = self.LoadByNameN(self.js, "UInt32Property", 0, 1929)
         time_new = self.LoadByNameN(self.js, "UInt32Property", 0, 1933)  # 1929+4
         
+        evidence["detailed_checks"]["time"] = {"old": time_old, "new": time_new}
+        
+        # Time values should be in range 256-270 typically
         if time_old is not None and 256 <= time_old <= 270:
-            detection_points["old_format"] += 1
+            evidence["old_format"] += 1
         if time_new is not None and 256 <= time_new <= 270:
-            detection_points["new_format"] += 1
+            evidence["new_format"] += 1
             
-        # Check 5: Social rank values (should be 1-6)
-        academics_old = self.LoadByNameN(self.js, "UInt32Property", 0, 5352)
-        academics_new = self.LoadByNameN(self.js, "UInt32Property", 0, 5356)  # 5352+4
+        # Final decision with improved logic
+        old_score = evidence["old_format"]
+        new_score = evidence["new_format"]
         
-        if academics_old is not None and 1 <= academics_old <= 6:
-            detection_points["old_format"] += 1
-        if academics_new is not None and 1 <= academics_new <= 6:
-            detection_points["new_format"] += 1
-            
-        # Cross-validation: Check playtime value for sanity (should be positive but not absurdly large)
-        playtime_old = self.LoadByNameN(self.js, "UInt32Property", 0, 12833)
-        playtime_new = self.LoadByNameN(self.js, "UInt32Property", 0, 12837)  # 12833+4
-        
-        # Reasonable playtime range (up to 999 hours in seconds)
-        if playtime_old is not None and 0 < playtime_old < 3600 * 999:
-            detection_points["old_format"] += 1
-        if playtime_new is not None and 0 < playtime_new < 3600 * 999:
-            detection_points["new_format"] += 1
-        
-        # Check 6: Check some social link values (should be positive and below 2^32)
-        sees_old = self.LoadByNameN(self.js, "UInt32Property", 0, 5300)
-        sees_new = self.LoadByNameN(self.js, "UInt32Property", 0, 5304)  # 5300+4
-        
-        if sees_old is not None and sees_old > 0:
-            detection_points["old_format"] += 1
-        if sees_new is not None and sees_new > 0:
-            detection_points["new_format"] += 1
-            
-        # Log the detection results
-        print(f"Save format detection results: Old format: {detection_points['old_format']} points, New format: {detection_points['new_format']} points")
-            
-        # Determine result based on detection points
-        if detection_points["new_format"] > detection_points["old_format"]:
+        # Enhanced logging
+        print(f"Save format detection results: Old format: {old_score} points, New format: {new_score} points")
+        print(f"Detection details: Money({evidence['detailed_checks']['money']}), "
+              f"Playtime({evidence['detailed_checks']['playtime']}), "
+              f"Date({evidence['detailed_checks']['date']})")
+              
+        # Decision logic: require clear evidence for new format due to importance
+        if new_score > old_score + 1:  # Need clear margin for new format
             return 4
         else:
             return 0
